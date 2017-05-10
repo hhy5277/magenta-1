@@ -35,6 +35,7 @@
 #include <kernel/vm/vm_aspace.h>
 
 #include <lib/console.h>
+#include <lib/memory_limit.h>
 #if WITH_LIB_DEBUGLOG
 #include <lib/debuglog.h>
 #endif
@@ -475,6 +476,7 @@ static void platform_mdi_init(void) {
     pdev_init(&kernel_drivers);
 }
 
+extern int _end;
 void platform_early_init(void)
 {
     // QEMU does not put device tree pointer in the boot-time x2 register,
@@ -511,8 +513,42 @@ void platform_early_init(void)
     if (arena_size) {
         arena.size = arena_size;
     }
-    pmm_add_arena(&arena);
 
+    // check if a memory limit was passed in via kernel.memory-limit-mb and
+    // find memory ranges to use if one is found.
+    mem_limit_ctx_t ctx;
+    bool added_arenas = false;
+    if (mem_limit_init(&ctx) == NO_ERROR) {
+        // For these ranges we're using the base physical values
+        ctx.kernel_base = MEMBASE + KERNEL_LOAD_OFFSET;
+        ctx.kernel_size = (uintptr_t)&_end - KERNEL_LOAD_OFFSET;
+        ctx.ramdisk_base = ramdisk_start_phys;
+        ctx.ramdisk_size = ramdisk_end_phys - ramdisk_start_phys;
+
+        iovec_t vecs[2];
+        size_t used;
+        mx_status_t status = mem_limit_get_iovs(&ctx, arena.base, arena.size, vecs, &used);
+        if (status == NO_ERROR) {
+            for (size_t i = 0; i < used; i++) {
+                pmm_arena_info_t new_arena;
+                new_arena.name = "sdram";
+                new_arena.flags = PMM_ARENA_FLAG_KMAP;
+                new_arena.priority = 0;
+                new_arena.base = reinterpret_cast<paddr_t>(vecs[i].iov_base);
+                new_arena.size = vecs[i].iov_len;
+                pmm_add_arena(&new_arena);
+            }
+            added_arenas = true;
+        } else {
+            printf("error %d applying memory limit, falling back to normal arena!\n", status);
+        }
+    }
+
+    // No memory arenas were added via the memory limit path so add the
+    // entirety of the global arena.
+    if (!added_arenas) {
+        pmm_add_arena(&arena);
+    }
 #ifdef BOOTLOADER_RESERVE_START
     /* Allocate memory regions reserved by bootloaders for other functions */
     pmm_alloc_range(BOOTLOADER_RESERVE_START, BOOTLOADER_RESERVE_SIZE / PAGE_SIZE, nullptr);
